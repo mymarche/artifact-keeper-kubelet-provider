@@ -65,7 +65,14 @@ kubelet --(pod SA token, aud=artifact-keeper)--> ak-kubelet-provider
    and then pulls **without credentials**, so the pull fails with a generic
    "pull access denied".
 
-Platform-specific install guides (on-prem kubeadm, EKS, GKE, AKS) are in progress.
+These steps are the reference for nodes whose kubelet you configure yourself
+(kubeadm and other self-managed clusters). For managed clusters:
+
+- **Amazon EKS** (AL2023 nodes): [docs/install-eks.md](docs/install-eks.md),
+  through `nodeadm` user data, next to `ecr-credential-provider`.
+- **GKE Standard and AKS**: [docs/install-gke-aks.md](docs/install-gke-aks.md),
+  through a privileged installer DaemonSet. **Not supported by Google or
+  Microsoft.**
 
 ## Configuration
 

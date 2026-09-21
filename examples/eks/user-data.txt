@@ -1,0 +1,70 @@
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="//"
+
+--//
+Content-Type: text/x-shellscript; charset="us-ascii"
+
+#!/bin/bash
+# EKS AL2023 user data for ak-kubelet-provider. See docs/install-eks.md.
+#
+# cloud-init runs this after nodeadm-config.service has written the ECR
+# provider's config (/etc/eks/image-credential-provider/config.json) and
+# before nodeadm-run.service starts the kubelet.
+set -euo pipefail
+
+DIR=/etc/eks/image-credential-provider
+# Release download URL, or an internal mirror with the same file names.
+BASE_URL=https://github.com/artifact-keeper/artifact-keeper-kubelet-provider/releases/download/v0.1.0
+# From ak-kubelet-provider-linux-{amd64,arm64}.sha256 of that release, after
+# verifying its signature (see the README).
+SHA256_AMD64="<sha256 from ak-kubelet-provider-linux-amd64.sha256>"
+SHA256_ARM64="<sha256 from ak-kubelet-provider-linux-arm64.sha256>"
+
+# 1. The binary, next to ecr-credential-provider (the bin dir nodeadm passes
+#    to the kubelet). Skip this block if it is baked into the AMI.
+case "$(uname -m)" in
+  x86_64) ARCH=amd64 SHA256=$SHA256_AMD64 ;;
+  aarch64) ARCH=arm64 SHA256=$SHA256_ARM64 ;;
+esac
+curl -fsSL --retry 5 -o /tmp/ak-kubelet-provider "$BASE_URL/ak-kubelet-provider-linux-$ARCH"
+echo "$SHA256  /tmp/ak-kubelet-provider" | sha256sum -c -
+install -m 0755 /tmp/ak-kubelet-provider "$DIR/ak-kubelet-provider"
+
+# 2. Our provider entry. Same fields as examples/credential-provider-config.yaml.
+cat > /tmp/ak-provider.json <<'EOF'
+{
+  "name": "ak-kubelet-provider",
+  "matchImages": ["ak.example.com"],
+  "defaultCacheDuration": "5m",
+  "apiVersion": "credentialprovider.kubelet.k8s.io/v1",
+  "args": ["--url=https://ak.example.com"],
+  "tokenAttributes": {
+    "serviceAccountTokenAudience": "artifact-keeper",
+    "cacheType": "ServiceAccount",
+    "requireServiceAccount": true
+  }
+}
+EOF
+
+# 3. nodeadm's config (with ecr-credential-provider, which the node needs for
+#    aws-node, kube-proxy and other add-on images) plus our entry, written to
+#    our own file: nodeadm rewrites config.json on every boot.
+jq --slurpfile ak /tmp/ak-provider.json \
+  '.providers = [.providers[] | select(.name != "ak-kubelet-provider")] + $ak' \
+  "$DIR/config.json" > "$DIR/ak-config.json.new"
+mv -f "$DIR/ak-config.json.new" "$DIR/ak-config.json"
+
+--//
+Content-Type: application/node.eks.aws
+
+---
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  kubelet:
+    flags:
+      # nodeadm puts its own --image-credential-provider-config first and
+      # these flags after it; the kubelet uses the last one.
+      - --image-credential-provider-config=/etc/eks/image-credential-provider/ak-config.json
+
+--//--

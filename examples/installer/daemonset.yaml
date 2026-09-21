@@ -1,0 +1,261 @@
+# Installer DaemonSet for nodes whose kubelet config you cannot set directly
+# (GKE Standard, AKS). See docs/install-gke-aks.md.
+#
+# NOT SUPPORTED BY THE CLOUD VENDOR. It is a privileged pod that edits the
+# kubelet's credential provider config on the host and restarts the kubelet.
+#
+# On every node it:
+#   1. reads --image-credential-provider-config and
+#      --image-credential-provider-bin-dir from the running kubelet, so it
+#      extends whatever the platform already set up (auth-provider-gcp on GKE,
+#      acr-credential-provider on AKS) and never replaces it;
+#   2. downloads ak-kubelet-provider for the node's architecture, refuses it
+#      unless its SHA-256 matches the pin below, and installs it in the bin dir;
+#   3. adds or updates the `ak-kubelet-provider` entry in the config, keeping
+#      every other provider;
+#   4. restarts the kubelet only if the config changed, waits for its healthz,
+#      and rolls the config back if the kubelet does not come up;
+#   5. repeats every RECONCILE_INTERVAL seconds, so a config that the
+#      platform rewrites (reboot, node repair, agent update) is fixed again.
+#      New nodes from upgrades or autoscaling get it when the pod starts.
+#
+# Before applying: set the provider entry, BINARY_BASE_URL and both SHA256_*
+# pins, pin the image by digest, and apply examples/rbac.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ak-kubelet-provider-installer
+  namespace: kube-system
+data:
+  # The provider entry added to the kubelet's CredentialProviderConfig.
+  # Same fields as in examples/credential-provider-config.yaml. `name` must stay
+  # `ak-kubelet-provider`: it is the binary name and the key used to update or
+  # remove the entry.
+  provider.yaml: |
+    name: ak-kubelet-provider
+    matchImages:
+      - "ak.example.com"
+    defaultCacheDuration: "5m"
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+    args:
+      - --url=https://ak.example.com
+    # A CA file (--ca-file / AK_CA_FILE) is read by the kubelet on the host,
+    # so it must be a host path, not a path in this pod.
+    tokenAttributes:
+      serviceAccountTokenAudience: artifact-keeper
+      cacheType: ServiceAccount
+      requireServiceAccount: true
+  install.sh: |
+    #!/bin/sh
+    # reconcile() runs as an `if` condition, where `set -e` does not apply, so
+    # every step that must stop a pass checks its own status.
+    set -u
+
+    NAME=ak-kubelet-provider
+    PROVIDER=/etc/ak-installer/provider.yaml
+    MODE=${MODE:-install}
+    INTERVAL=${RECONCILE_INTERVAL:-300}
+
+    log() { echo "ak-installer: $*" >&2; }
+
+    # Run a command in the host's namespaces (needs hostPID).
+    host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+
+    # Value of a kubelet flag given as --flag=value or --flag value; the last
+    # occurrence wins, as in the kubelet.
+    kubelet_flag() {
+      tr '\0' '\n' < "/proc/$1/cmdline" | awk -v f="--$2" '
+        take { v = $0; take = 0; next }
+        $0 == f { take = 1; next }
+        index($0, f "=") == 1 { v = substr($0, length(f) + 2) }
+        END { print v }'
+    }
+
+    kubelet_healthy() {
+      i=0
+      while [ "$i" -lt 30 ]; do
+        sleep 2
+        [ "$(wget -q -T 2 -O - http://127.0.0.1:10248/healthz 2>/dev/null)" = ok ] && return 0
+        i=$((i + 1))
+      done
+      return 1
+    }
+
+    restart_kubelet() {
+      log "restarting kubelet"
+      host systemctl restart kubelet
+      kubelet_healthy
+    }
+
+    install_binary() {
+      case "$(uname -m)" in
+        x86_64) arch=amd64; want=$SHA256_AMD64 ;;
+        aarch64 | arm64) arch=arm64; want=$SHA256_ARM64 ;;
+        *) log "unsupported architecture $(uname -m)"; return 1 ;;
+      esac
+      if ! echo "$want" | grep -Eq '^[0-9a-f]{64}$'; then
+        log "SHA256_$(echo "$arch" | tr a-z A-Z) is not a SHA-256; set the pin from the release's .sha256 file"
+        return 1
+      fi
+      have=$(sha256sum "$1" 2>/dev/null | awk '{print $1}') || true
+      [ "$have" = "$want" ] && return 0
+
+      url="$BINARY_BASE_URL/$NAME-linux-$arch"
+      wget -q -T 60 -O /tmp/bin "$url" || { log "download failed: $url"; return 1; }
+      got=$(sha256sum /tmp/bin | awk '{print $1}')
+      if [ "$got" != "$want" ]; then
+        log "checksum mismatch for $url: got $got, want $want"
+        return 1
+      fi
+      cp /tmp/bin "$1.ak-new" && chmod 0755 "$1.ak-new" && mv -f "$1.ak-new" "$1" || return 1
+      log "installed ${1#/host} ($want)"
+    }
+
+    reconcile() {
+      pid=$(pidof kubelet | awk '{print $1}')
+      [ -n "$pid" ] || { log "kubelet is not running"; return 1; }
+      cfg=$(kubelet_flag "$pid" image-credential-provider-config)
+      bin=$(kubelet_flag "$pid" image-credential-provider-bin-dir)
+      if [ -z "$cfg" ] || [ -z "$bin" ]; then
+        log "the kubelet has no --image-credential-provider-config/--image-credential-provider-bin-dir;" \
+          "this installer only extends an existing credential provider setup"
+        return 1
+      fi
+      hcfg=/host$cfg
+      hbin=/host$bin/$NAME
+      [ -f "$hcfg" ] || { log "$cfg does not exist"; return 1; }
+      fmt=yaml
+      case "$cfg" in *.json) fmt=json ;; esac
+
+      if [ "$MODE" = uninstall ]; then
+        yq -p "$fmt" -o "$fmt" ".providers |= map(select(.name != \"$NAME\"))" "$hcfg" > /tmp/config ||
+          { log "cannot parse $cfg"; return 1; }
+      else
+        if [ "$(yq '.name' "$PROVIDER")" != "$NAME" ]; then
+          log "provider.yaml must have name: $NAME"
+          return 1
+        fi
+        # The binary goes first, so the config never names a missing binary.
+        install_binary "$hbin" || return 1
+        yq -p "$fmt" -o "$fmt" \
+          ".providers = ((.providers // []) | map(select(.name != \"$NAME\"))) + [load(\"$PROVIDER\")]" \
+          "$hcfg" > /tmp/config || { log "cannot merge provider.yaml into $cfg"; return 1; }
+      fi
+
+      if ! cmp -s /tmp/config "$hcfg"; then
+        want=$(sha256sum /tmp/config | awk '{print $1}')
+        if [ "$(cat "$hcfg.ak-failed" 2>/dev/null)" = "$want" ]; then
+          log "not applying a config the kubelet already failed to start with; fix provider.yaml"
+          return 1
+        fi
+        cp -p "$hcfg" "$hcfg.ak-prev" && cp -p "$hcfg" "$hcfg.ak-new" &&
+          cat /tmp/config > "$hcfg.ak-new" && mv -f "$hcfg.ak-new" "$hcfg" ||
+          { log "cannot write $cfg"; return 1; }
+        log "updated $cfg ($MODE)"
+        if ! restart_kubelet; then
+          log "kubelet not healthy with the new $cfg; rolling back"
+          mv -f "$hcfg.ak-prev" "$hcfg"
+          echo "$want" > "$hcfg.ak-failed"
+          if restart_kubelet; then log "kubelet healthy after rollback"; else log "kubelet still not healthy after rollback"; fi
+          return 1
+        fi
+        log "kubelet healthy"
+      fi
+      rm -f "$hcfg.ak-prev" "$hcfg.ak-failed"
+
+      if [ "$MODE" = uninstall ] && [ -e "$hbin" ]; then
+        rm -f "$hbin" || return 1
+        log "removed $bin/$NAME"
+      fi
+      return 0
+    }
+
+    while :; do
+      if reconcile; then touch /tmp/ready; else rm -f /tmp/ready; fi
+      sleep "$INTERVAL"
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ak-kubelet-provider-installer
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: ak-kubelet-provider-installer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ak-kubelet-provider-installer
+  # One node at a time, and wait a minute on each: a node whose kubelet does
+  # not come back stops the rollout instead of spreading.
+  minReadySeconds: 60
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ak-kubelet-provider-installer
+      annotations:
+        # Change this to roll a ConfigMap change out to running pods at once;
+        # otherwise it is picked up within RECONCILE_INTERVAL.
+        ak-kubelet-provider/revision: "1"
+    spec:
+      # Critical pods are only admitted in kube-system on GKE by default.
+      priorityClassName: system-node-critical
+      hostPID: true       # find the kubelet and enter the host's namespaces
+      hostNetwork: true   # reach the kubelet's healthz on 127.0.0.1:10248
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: installer
+          # Provides sh, yq, wget, sha256sum and nsenter. Pin by digest, and
+          # do NOT pull it from Artifact Keeper through this plugin.
+          image: mikefarah/yq:4
+          command: ["/bin/sh", "/etc/ak-installer/install.sh"]
+          env:
+            - name: MODE
+              value: install   # `uninstall` removes the entry and the binary
+            - name: BINARY_BASE_URL
+              # Release download URL or an internal mirror with the same
+              # file names (ak-kubelet-provider-linux-{amd64,arm64}).
+              value: https://github.com/artifact-keeper/artifact-keeper-kubelet-provider/releases/download/v0.1.0
+            - name: SHA256_AMD64
+              value: "<sha256 from ak-kubelet-provider-linux-amd64.sha256>"
+            - name: SHA256_ARM64
+              value: "<sha256 from ak-kubelet-provider-linux-arm64.sha256>"
+            - name: RECONCILE_INTERVAL
+              value: "300"
+            # busybox wget reads the lower-case variable.
+            # - name: https_proxy
+            #   value: http://proxy.example.com:3128
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          readinessProbe:
+            exec:
+              command: ["cat", "/tmp/ready"]
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: host
+              mountPath: /host
+            - name: installer
+              mountPath: /etc/ak-installer
+              readOnly: true
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+        - name: installer
+          configMap:
+            name: ak-kubelet-provider-installer
