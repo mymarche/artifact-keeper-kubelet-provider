@@ -1,0 +1,7 @@
+name: "Artifact Keeper kubelet provider CodeQL Config"
+
+# Tests print captured stderr in assertion messages on purpose: they assert
+# that no token reaches it. Test code is not shipped.
+paths-ignore:
+  - "tests"
+  - "target"
