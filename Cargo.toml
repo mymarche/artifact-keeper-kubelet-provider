@@ -1,6 +1,6 @@
 [package]
 name = "artifact-keeper-kubelet-provider"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 description = "Kubelet image credential provider that exchanges pod ServiceAccount tokens for Artifact Keeper registry credentials"
 edition = "2024"
 license = "MIT"
