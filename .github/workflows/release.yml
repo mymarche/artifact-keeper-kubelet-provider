@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: ak-kubelet-provider-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            artifact: ak-kubelet-provider-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check static linking and tag version
+        run: |
+          bin=target/${{ matrix.target }}/release/ak-kubelet-provider
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          "$bin" --version | grep -Fx "ak-kubelet-provider ${GITHUB_REF_NAME#v}"
+          cp "$bin" ${{ matrix.artifact }}
+          chmod 755 ${{ matrix.artifact }}
+          sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json --override-filename ak-kubelet-provider.cdx
+          test -s ak-kubelet-provider.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: ak-kubelet-provider.cdx.json
+
+  release:
+    name: Create Release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Required for keyless (Sigstore OIDC) signing with cosign.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Pinned to a cosign v2 release, as in artifact-keeper-cli: cosign v3
+      # changed keyless sign-blob to bundle-only output.
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.6.3"
+
+      - name: Sign release artifacts (cosign keyless)
+        run: |
+          cd artifacts
+          for f in ak-kubelet-provider-linux-* ak-kubelet-provider.cdx.json; do
+            case "$f" in
+              *.sig|*.pem) continue ;;
+            esac
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+
+      - name: Verify one signature before publishing
+        run: |
+          cd artifacts
+          cosign verify-blob \
+            --certificate ak-kubelet-provider-linux-amd64.pem \
+            --signature ak-kubelet-provider-linux-amd64.sig \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ak-kubelet-provider-linux-amd64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Verifying signatures
+
+            Every binary, checksum-covered artifact and the CycloneDX SBOM is signed with
+            [cosign](https://docs.sigstore.dev/cosign/signing/signing_with_blobs/) (keyless,
+            via the GitHub Actions OIDC identity). This binary runs as root on every node:
+            verify it before installing.
+
+            ```sh
+            cosign verify-blob \
+              --certificate ak-kubelet-provider-linux-amd64.pem \
+              --signature ak-kubelet-provider-linux-amd64.sig \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              ak-kubelet-provider-linux-amd64
+            sha256sum -c ak-kubelet-provider-linux-amd64.sha256
+            ```
+          files: |
+            artifacts/ak-kubelet-provider-linux-*
+            artifacts/ak-kubelet-provider.cdx.json*

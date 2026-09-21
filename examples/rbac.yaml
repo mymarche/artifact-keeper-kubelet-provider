@@ -1,0 +1,35 @@
+# Allow kubelets to request ServiceAccount tokens for Artifact Keeper's audience.
+#
+# Since Kubernetes 1.33 the ServiceAccountNodeAudienceRestriction admission
+# check refuses a node's token request for an audience that is neither in the
+# pod's projected volumes nor granted to the node. Without this grant the
+# kubelet logs
+#   audience "artifact-keeper" not found in pod spec volume,
+#   system:node:<node> is not authorized to request tokens for this audience
+# and then pulls WITHOUT credentials, so the pull fails with a generic
+# "pull access denied".
+#
+# `resources` is the audience itself, exactly as set in
+# tokenAttributes.serviceAccountTokenAudience. A URL audience such as
+# https://ak.example.com works as well. Verified on Kubernetes 1.34.3.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ak-kubelet-provider-audience
+rules:
+  - apiGroups: [""]
+    resources: ["artifact-keeper"]
+    verbs: ["request-serviceaccounts-token-audience"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ak-kubelet-provider-audience
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ak-kubelet-provider-audience
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:nodes
