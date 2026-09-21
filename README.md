@@ -14,7 +14,7 @@ kubelet --(pod SA token, aud=artifact-keeper)--> ak-kubelet-provider
                                                Artifact Keeper
                                                verifies the token against the cluster's
                                                issuer keys, matches an identity mapping,
-                                               mints a read-only token (no refresh token)
+                                               mints a short-lived token
 ```
 
 ## Requirements
@@ -22,9 +22,16 @@ kubelet --(pod SA token, aud=artifact-keeper)--> ak-kubelet-provider
 - **Kubernetes 1.34 or later.** The plugin relies on the kubelet supplying a
   ServiceAccount token (KEP-4412, `tokenAttributes`). Older clusters are not
   supported.
-- **Artifact Keeper with a `kubernetes` CI OIDC provider** for the cluster, and
-  identity mappings for the namespaces or ServiceAccounts that may pull. See
-  `docs/ci-oidc.md` in the Artifact Keeper repository.
+- **Artifact Keeper with a CI OIDC provider for the cluster**, and identity
+  mappings for the ServiceAccounts that may pull:
+  - **1.10.0 and later:** works today with a `generic` provider. See
+    [Artifact Keeper 1.10: `generic` provider](#artifact-keeper-110-generic-provider)
+    for the setup and its limits.
+  - **Before 1.10.0:** the exchange needs the provider id, so set
+    `--provider-id`. Otherwise the same setup applies.
+  - A dedicated `kubernetes` provider type (pull-only token, no refresh token,
+    namespace-level mappings, static keys for unreachable issuers) is planned in
+    Artifact Keeper. It will make most of the limits below go away.
 - Nodes that can reach Artifact Keeper over HTTPS.
 
 ## Install
@@ -89,18 +96,114 @@ the two are the same, every pod's default token is accepted by Artifact Keeper,
 and every token the plugin sends to Artifact Keeper is also valid against the
 API server.
 
-## What the credential can do
+## Artifact Keeper 1.10: `generic` provider
 
-The credential is minted by Artifact Keeper for a `kubernetes` provider:
+Verified end to end on a kind 1.34.3 cluster against Artifact Keeper 1.10.0
+running **inside the same cluster** with the kubeadm default issuer. That is the
+hardest on-prem case. Managed clusters need fewer steps (see step 1).
 
-- **read-only** (`read:artifacts`, `read:repositories`): pushes are refused
-  even if the mapping's groups could write;
-- **no refresh token**: it cannot be renewed once it expires;
-- limited to the repositories the identity mapping allows.
+### 1. Let Artifact Keeper reach the cluster's issuer
 
-The kubelet caches it per registry and per ServiceAccount for `cacheDuration`
-(the token lifetime minus `--cache-margin`). If the token would expire within
-the margin, the response disables caching.
+Artifact Keeper verifies the token by fetching
+`{issuer}/.well-known/openid-configuration` and the `jwks_uri` it names. The
+issuer is the `iss` of your ServiceAccount tokens:
+
+```sh
+kubectl create token default --duration 10m | cut -d. -f2 | base64 -d 2>/dev/null | grep -o '"iss":"[^"]*"'
+```
+
+- **EKS, GKE, AKS with the OIDC issuer enabled:** the issuer is public. Nothing
+  to do.
+- **On-prem, Artifact Keeper in the same cluster** (kubeadm default issuer
+  `https://kubernetes.default.svc.cluster.local`):
+  - allow anonymous discovery. By default only authenticated ServiceAccounts
+    may read it:
+
+    ```sh
+    kubectl create clusterrolebinding oidc-discovery-anonymous \
+      --clusterrole=system:service-account-issuer-discovery --group=system:unauthenticated
+    ```
+
+  - on Artifact Keeper, trust the cluster CA and allow private addresses. The
+    issuer resolves to the ClusterIP, and `jwks_uri` points at the API server's
+    node IP:
+
+    ```yaml
+    env:
+      - {name: CUSTOM_CA_CERT_PATH, value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt}
+      - {name: SSO_ALLOW_PRIVATE_IPS, value: "true"}
+    ```
+
+- **On-prem, Artifact Keeper outside the cluster:** the issuer URL itself must
+  be reachable from Artifact Keeper. That means a cluster started with a
+  `--service-account-issuer` that resolves from outside, plus the same discovery
+  binding, CA and private-address settings. If that is not possible, wait for
+  static keys in the `kubernetes` provider type.
+
+### 2. Create the provider
+
+```sh
+curl -X POST https://ak.example.com/api/v1/admin/ci-oidc \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"prod-cluster","provider_type":"generic",
+       "issuer_url":"https://kubernetes.default.svc.cluster.local",
+       "audience":"artifact-keeper"}'
+```
+
+`issuer_url` is the token's `iss` exactly. `audience` equals
+`tokenAttributes.serviceAccountTokenAudience`.
+
+### 3. One mapping per ServiceAccount
+
+```sh
+curl -X POST https://ak.example.com/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"team-app","priority":10,
+       "claim_filters":{"sub":"system:serviceaccount:team:app"}}'
+```
+
+Create **one mapping per ServiceAccount**, filtered on its exact `sub`. In 1.10
+a mapping serves only the first `sub` that ever used it. A second ServiceAccount
+admitted by the same mapping (for example through an any-of list) is refused
+with `409 Username already exists` (artifact-keeper#4031). Whole-namespace
+mappings are not possible yet.
+
+### 4. Grant read access after the first pull
+
+The mapping's service account (`ci-<8 hex of the mapping id>`, display name
+`CI [<provider>] <mapping>`) is created by its **first** exchange. The first
+pull therefore fails: Artifact Keeper answers `not found` so as not to reveal
+the repository. Then:
+
+1. find the account under Users (search `ci-`);
+2. add it to a group that has **read-only** permission on the repositories to
+   pull from (`POST /api/v1/groups/{id}/members`,
+   `POST /api/v1/permissions` with `"actions":["read"]`).
+
+The kubelet retries on its own, and the pull succeeds without restarting the
+pod. Permissions are checked per request, so a credential it already cached
+works too.
+
+### Limits of this setup
+
+- **Pull-only is up to you.** The minted token carries no action scope, so what
+  it can do is exactly what the account's groups allow. Grant **read only**:
+  with read only, a push with the node's credential is refused
+  (`denied: You do not have access to this repository`). The same credential
+  would push if a group granted write.
+- The server's log attributes an exchange to the token's `sub` only, not to the
+  pod or node.
+- The token lifetime is Artifact Keeper's access-token lifetime, capped at the
+  ServiceAccount token's own expiry.
+
+## Caching
+
+The kubelet caches the credential per registry and per ServiceAccount for
+`cacheDuration`: the token lifetime minus `--cache-margin`. If the token would
+expire within the margin, the response disables caching. With
+`tokenAttributes.cacheType: ServiceAccount`, a second pod of the same
+ServiceAccount reuses the cached credential, while a different ServiceAccount
+triggers its own exchange.
 
 ## Troubleshooting
 
@@ -121,8 +224,11 @@ run. Check `matchImages`, and look for a refused token request
 | `request has no serviceAccountToken; set tokenAttributes ...`           | The kubelet config for this provider has no `tokenAttributes`, or the kubelet is older than 1.34. |
 | `unsupported apiVersion ...`                                            | The provider's `apiVersion` in `CredentialProviderConfig` is not `credentialprovider.kubelet.k8s.io/v1`. |
 | `refusing to send a ServiceAccount token over plain http ...`           | `--url` is `http://`. Use `https://`. |
-| `<url>: 401 CI JWT did not match any identity mapping`                  | No enabled mapping matches this ServiceAccount. Check the mapping's `claim_filters` (e.g. `/kubernetes.io/namespace`). |
-| `<url>: 404 No enabled CI OIDC provider is configured for issuer ...`   | No `kubernetes` provider for this cluster's issuer, or it is disabled. |
+| `<url>: 401 CI JWT did not match any identity mapping`                  | No enabled mapping matches this ServiceAccount. Check the mapping's `claim_filters` (`sub` is `system:serviceaccount:<ns>:<name>`). |
+| `<url>: 409 Username already exists`                                    | Artifact Keeper 1.10: the mapping already serves another ServiceAccount. Use one mapping per ServiceAccount. |
+| `<url>: 404 No enabled CI OIDC provider is configured for issuer ...`   | No provider for this cluster's issuer, or it is disabled. `issuer_url` must equal the token's `iss`. |
+| containerd: `not found` for an image that exists                        | The account has no read permission yet. Add its `ci-…` account to a read-only group (see step 4 above). |
+| Any exchange error while the Artifact Keeper log shows a failed discovery or JWKS fetch | Artifact Keeper cannot reach the issuer. Check step 1 above. |
 | `<url>: 400 ... supply provider_id to choose one`                       | Several providers share this cluster's issuer. Set `--provider-id`, or give the cluster a unique `--service-account-issuer`. |
 | `<url>: 401 CI JWT validation failed ...`                               | Signature, audience or expiry check failed. Check that `serviceAccountTokenAudience` equals the provider's audience, and for static-key providers that the JWKS holds the cluster's current key. |
 | `<url>: timed out after 10s`                                            | Artifact Keeper is unreachable from the node, or a proxy is needed (`HTTPS_PROXY`). |
