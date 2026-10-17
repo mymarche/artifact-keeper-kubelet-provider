@@ -88,15 +88,20 @@ kubectl get --raw /.well-known/openid-configuration | jq -r .issuer
   ```
 
   Enabling it changes the issuer of newly minted tokens. Without it, Artifact
-  Keeper cannot fetch the cluster's keys, and 1.10 has no static keys, so this
-  setup needs the OIDC issuer enabled.
+  Keeper cannot fetch the cluster's keys. With Artifact Keeper 1.11 you can
+  instead leave it off and give the `kubernetes` provider the cluster's keys as
+  `key_source: static`. Artifact Keeper 1.10 has no static keys, so there the
+  OIDC issuer must be enabled.
 
 Create a CI OIDC provider in Artifact Keeper with that issuer and a dedicated
 audience, for example `artifact-keeper`, and identity mappings for the
-ServiceAccounts that may pull. With Artifact Keeper 1.10 this is a `generic`
-provider with one mapping per ServiceAccount. Follow
+ServiceAccounts that may pull. With Artifact Keeper 1.11 or later, create a
+`kubernetes` provider with `key_source: discovery` and a mapping bound to a
+read-only group. Follow
+[Artifact Keeper 1.11: `kubernetes` provider](../README.md#artifact-keeper-111-kubernetes-provider).
+With Artifact Keeper 1.10 use a `generic` provider and follow
 [Artifact Keeper 1.10: `generic` provider](../README.md#artifact-keeper-110-generic-provider),
-steps 2 to 4. The issuer is public here, so its step 1 needs nothing.
+steps 2 to 4. The issuer is public here, so step 1 of either needs nothing.
 
 ### 2. Cluster: let nodes request tokens for the audience
 
